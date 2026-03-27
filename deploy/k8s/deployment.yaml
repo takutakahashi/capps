@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw-gateway
+  namespace: openclaw
+  labels:
+    app: openclaw-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openclaw-gateway
+  template:
+    metadata:
+      labels:
+        app: openclaw-gateway
+    spec:
+      # Short pod hostname to avoid mDNS DNS label length limit (63 bytes)
+      hostname: openclaw
+      initContainers:
+        # Copy config file before the gateway starts so it reads the correct bind/auth settings.
+        - name: init-config
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /home/node/.openclaw
+              cp /config/openclaw.json /home/node/.openclaw/openclaw.json
+              echo "Config installed:"
+              cat /home/node/.openclaw/openclaw.json
+          volumeMounts:
+            - name: openclaw-config
+              mountPath: /config
+            - name: openclaw-data
+              mountPath: /home/node/.openclaw
+      containers:
+        - name: gateway
+          image: ghcr.io/openclaw/openclaw:main
+          env:
+            - name: OPENCLAW_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-gateway
+                  key: token
+          ports:
+            - name: gateway
+              containerPort: 18789
+              protocol: TCP
+          volumeMounts:
+            - name: openclaw-data
+              mountPath: /home/node/.openclaw
+          readinessProbe:
+            tcpSocket:
+              port: 18789
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: 18789
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: openclaw-config
+          configMap:
+            name: openclaw-config
+        - name: openclaw-data
+          emptyDir: {}

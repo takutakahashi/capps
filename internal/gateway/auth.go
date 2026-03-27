@@ -2,13 +2,15 @@ package gateway
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"github.com/takutakahashi/capps/internal/config"
@@ -30,8 +32,11 @@ func performHandshake(ctx context.Context, conn *websocket.Conn, cfg *config.Con
 	}
 
 	// Step 2: send the connect request.
-	connectID := uuid.NewString()
-	params := buildConnectParams(cfg, nonce)
+	connectID := newRequestID()
+	params, err := buildConnectParams(cfg, nonce)
+	if err != nil {
+		return fmt.Errorf("build connect params: %w", err)
+	}
 	req := RequestFrame{
 		Type:   FrameTypeRequest,
 		ID:     connectID,
@@ -52,7 +57,6 @@ func performHandshake(ctx context.Context, conn *websocket.Conn, cfg *config.Con
 
 // receiveChallenge waits for the "connect.challenge" event and returns the nonce.
 func receiveChallenge(ctx context.Context, conn *websocket.Conn) (string, error) {
-	// Set a read deadline based on the context.
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetReadDeadline(deadline)
 		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
@@ -69,13 +73,7 @@ func receiveChallenge(ctx context.Context, conn *websocket.Conn) (string, error)
 			return "", fmt.Errorf("unmarshal: %w", err)
 		}
 
-		if incoming.Type != FrameTypeEvent {
-			// Unexpected frame before handshake; skip.
-			continue
-		}
-
-		if incoming.Event != "connect.challenge" {
-			// Some other event; skip and keep waiting.
+		if incoming.Type != FrameTypeEvent || incoming.Event != "connect.challenge" {
 			continue
 		}
 
@@ -112,7 +110,6 @@ func receiveHelloOK(ctx context.Context, conn *websocket.Conn, connectID string)
 		}
 
 		if incoming.Type == FrameTypeEvent {
-			// Gateway may emit additional events during handshake; skip them.
 			continue
 		}
 
@@ -126,7 +123,6 @@ func receiveHelloOK(ctx context.Context, conn *websocket.Conn, connectID string)
 		}
 
 		if res.ID != connectID {
-			// Response for a different request; skip.
 			continue
 		}
 
@@ -143,12 +139,43 @@ func receiveHelloOK(ctx context.Context, conn *websocket.Conn, connectID string)
 
 // buildConnectParams constructs the params for the "connect" RPC method.
 //
-// The device fingerprint is derived from the hostname to provide a stable,
-// reproducible identifier for this capps instance without requiring key management.
-func buildConnectParams(cfg *config.Config, nonce string) ConnectParams {
-	hostname, _ := os.Hostname()
-	deviceID := deviceFingerprint(cfg.ClientID, hostname)
-	now := time.Now().UnixMilli()
+// It uses an Ed25519 key pair (generated once per process) to produce the
+// device identity and signature required by the openclaw protocol v3.
+func buildConnectParams(cfg *config.Config, nonce string) (ConnectParams, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return ConnectParams{}, fmt.Errorf("generate ed25519 key: %w", err)
+	}
+
+	// Device ID = SHA256 of the raw 32-byte Ed25519 public key, hex-encoded.
+	deviceID := deviceFingerprintEd25519(pub)
+
+	// Public key transmitted in the connect request = raw 32 bytes, base64url (no padding).
+	pubKeyB64 := base64URLEncode(pub)
+
+	signedAtMs := time.Now().UnixMilli()
+
+	token := cfg.Token
+	platform := "linux"
+	deviceFamily := ""
+
+	// V3 signing payload: all fields joined by "|".
+	payload := strings.Join([]string{
+		"v3",
+		deviceID,
+		"cli",   // clientId  = GATEWAY_CLIENT_IDS.CLI
+		"cli",   // clientMode = GATEWAY_CLIENT_MODES.CLI
+		"operator",
+		"operator.read,operator.write",
+		fmt.Sprintf("%d", signedAtMs),
+		token,
+		nonce,
+		platform,
+		deviceFamily,
+	}, "|")
+
+	sig := ed25519.Sign(priv, []byte(payload))
+	sigB64 := base64URLEncode(sig)
 
 	auth := ConnectAuth{}
 	if cfg.Token != "" {
@@ -157,43 +184,44 @@ func buildConnectParams(cfg *config.Config, nonce string) ConnectParams {
 		auth.Password = cfg.Password
 	}
 
-	platform := "linux"
-	if hostname != "" {
-		// Best-effort platform detection; defaults to linux.
-	}
-
 	return ConnectParams{
 		MinProtocol: protocolVersion,
 		MaxProtocol: protocolVersion,
 		Client: ConnectClient{
-			ID:       cfg.ClientID,
+			// "cli"/"cli" matches GATEWAY_CLIENT_IDS.CLI / GATEWAY_CLIENT_MODES.CLI
+			// constants defined in the openclaw protocol schema.
+			ID:       "cli",
 			Version:  cfg.ClientVersion,
 			Platform: platform,
-			Mode:     "operator",
+			Mode:     "cli",
 		},
 		Role:   "operator",
 		Scopes: []string{"operator.read", "operator.write"},
 		Auth:   auth,
 		Device: ConnectDevice{
 			ID:        deviceID,
-			PublicKey: deviceID, // Use fingerprint as a stable public key placeholder.
-			Signature: signDevice(deviceID, nonce, now),
-			SignedAt:  now,
+			PublicKey: pubKeyB64,
+			Signature: sigB64,
+			SignedAt:  signedAtMs,
 			Nonce:     nonce,
 		},
-	}
+	}, nil
 }
 
-// deviceFingerprint generates a stable, deterministic identifier for this capps
-// instance based on the client name and hostname.
-func deviceFingerprint(clientID, hostname string) string {
-	h := sha256.Sum256([]byte(clientID + ":" + hostname))
-	return fmt.Sprintf("%x", h[:16])
-}
-
-// signDevice produces a deterministic signature for the device challenge.
-// This is a simple HMAC-like construction sufficient for capps' operator role.
-func signDevice(deviceID, nonce string, signedAt int64) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", deviceID, nonce, signedAt)))
+// deviceFingerprintEd25519 returns the SHA256 hex of the raw 32-byte Ed25519 public key.
+func deviceFingerprintEd25519(pub ed25519.PublicKey) string {
+	h := sha256.Sum256([]byte(pub))
 	return fmt.Sprintf("%x", h[:])
+}
+
+// base64URLEncode encodes bytes as base64url with no padding (RFC 4648 §5).
+func base64URLEncode(b []byte) string {
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// newRequestID generates a random UUID-like request ID.
+func newRequestID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

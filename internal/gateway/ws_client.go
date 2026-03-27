@@ -252,7 +252,9 @@ func (c *wsClient) dispatch(raw []byte) {
 	case FrameTypeEvent:
 		var evt EventFrame
 		if err := json.Unmarshal(raw, &evt); err != nil {
-			c.logger.Warn("failed to unmarshal event frame", zap.Error(err))
+			// Log at debug level — openclaw may send events with schema variations
+			// (e.g. stateVersion as object instead of int) that are safe to ignore.
+			c.logger.Debug("failed to unmarshal event frame (ignored)", zap.Error(err))
 			return
 		}
 		c.logger.Debug("received event", zap.String("event", evt.Event))
